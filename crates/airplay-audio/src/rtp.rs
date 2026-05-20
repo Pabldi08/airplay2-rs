@@ -14,6 +14,7 @@ use std::time::Duration;
 ///
 /// Also enlarges the kernel send buffer (SO_SNDBUF) to 1MB to prevent drops
 /// when bursting packets to multiple group devices simultaneously.
+#[cfg(unix)]
 fn set_socket_qos(socket: &UdpSocket) {
     use std::os::unix::io::AsRawFd;
     let fd = socket.as_raw_fd();
@@ -66,6 +67,14 @@ fn set_socket_qos(socket: &UdpSocket) {
         }
     }
 }
+
+/// Windows: SO_SNDBUF / DSCP requieren WSA/IPHelper distintos. Lo dejamos como
+/// stub para que el crate compile; single-room sin QoS funciona bien. Si en el
+/// futuro queremos QoS en Windows, hay que usar `qWAVE` o `setsockopt` con
+/// constantes de `winapi`/`windows-sys` (IP_TOS está como int en Windows pero
+/// la firma de setsockopt en `libc::windows` espera `*const i8`, no compatible).
+#[cfg(not(unix))]
+fn set_socket_qos(_socket: &UdpSocket) {}
 
 /// RTP payload types for AirPlay.
 pub mod payload_types {
