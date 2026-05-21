@@ -53,7 +53,58 @@ fn set_realtime_priority() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// On Windows: raise thread priority to TIME_CRITICAL and associate the
+/// thread to the "Pro Audio" MMCSS task class. MMCSS exempts the thread
+/// from the regular scheduler's fairness throttling, which is what causes
+/// the audible tics every 20-30s under a busy desktop. The thread keeps
+/// the MMCSS handle until process exit — the OS reverts on cleanup.
+#[cfg(windows)]
+fn set_realtime_priority() {
+    use std::ffi::c_void;
+    use std::os::raw::c_int;
+
+    #[allow(non_camel_case_types)]
+    type HANDLE = *mut c_void;
+    #[allow(non_camel_case_types)]
+    type BOOL = i32;
+    const THREAD_PRIORITY_TIME_CRITICAL: c_int = 15;
+
+    extern "system" {
+        fn GetCurrentThread() -> HANDLE;
+        fn SetThreadPriority(thread: HANDLE, priority: c_int) -> BOOL;
+    }
+
+    #[link(name = "avrt")]
+    extern "system" {
+        fn AvSetMmThreadCharacteristicsW(task: *const u16, task_index: *mut u32) -> HANDLE;
+    }
+
+    unsafe {
+        let ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        if ok != 0 {
+            tracing::info!("Windows: sender thread priority set to TIME_CRITICAL");
+        } else {
+            tracing::warn!("Windows: SetThreadPriority(TIME_CRITICAL) failed");
+        }
+
+        let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+        let mut task_index: u32 = 0;
+        let handle = AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut task_index as *mut _);
+        if handle.is_null() {
+            tracing::warn!("Windows: AvSetMmThreadCharacteristicsW(\"Pro Audio\") returned NULL");
+        } else {
+            tracing::info!(
+                "Windows: MMCSS \"Pro Audio\" task associated (task_index={task_index})"
+            );
+            // Intencional: no llamamos AvRevertMmThreadCharacteristics. El thread
+            // vive hasta el final del streaming; el SO libera el slot MMCSS al
+            // terminar el proceso. Liberarlo dentro del loop sería innecesario.
+            std::mem::forget(handle);
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn set_realtime_priority() {
     tracing::debug!("RT priority not supported on this platform");
 }
