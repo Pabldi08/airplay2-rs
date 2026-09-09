@@ -53,53 +53,59 @@ fn set_realtime_priority() {
     }
 }
 
-/// On Windows: raise thread priority to TIME_CRITICAL and associate the
-/// thread to the "Pro Audio" MMCSS task class. MMCSS exempts the thread
-/// from the regular scheduler's fairness throttling, which is what causes
-/// the audible tics every 20-30s under a busy desktop. The thread keeps
-/// the MMCSS handle until process exit — the OS reverts on cleanup.
+/// Keep the current thread in the "Pro Audio" MMCSS task class for as long as
+/// the returned guard is alive.
 #[cfg(windows)]
-fn set_realtime_priority() {
+struct MmcssGuard(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for MmcssGuard {
+    fn drop(&mut self) {
+        #[link(name = "avrt")]
+        extern "system" {
+            fn AvRevertMmThreadCharacteristics(handle: *mut std::ffi::c_void) -> i32;
+        }
+        unsafe {
+            if AvRevertMmThreadCharacteristics(self.0) == 0 {
+                tracing::warn!("Windows: AvRevertMmThreadCharacteristics failed");
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn set_realtime_priority() -> Option<MmcssGuard> {
     use std::ffi::c_void;
-    use std::os::raw::c_int;
 
     #[allow(non_camel_case_types)]
     type HANDLE = *mut c_void;
     #[allow(non_camel_case_types)]
     type BOOL = i32;
-    const THREAD_PRIORITY_TIME_CRITICAL: c_int = 15;
-
-    extern "system" {
-        fn GetCurrentThread() -> HANDLE;
-        fn SetThreadPriority(thread: HANDLE, priority: c_int) -> BOOL;
-    }
+    const AVRT_PRIORITY_CRITICAL: i32 = 2;
 
     #[link(name = "avrt")]
     extern "system" {
         fn AvSetMmThreadCharacteristicsW(task: *const u16, task_index: *mut u32) -> HANDLE;
+        fn AvSetMmThreadPriority(handle: HANDLE, priority: i32) -> BOOL;
+        fn AvRevertMmThreadCharacteristics(handle: HANDLE) -> BOOL;
     }
 
     unsafe {
-        let ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-        if ok != 0 {
-            tracing::info!("Windows: sender thread priority set to TIME_CRITICAL");
-        } else {
-            tracing::warn!("Windows: SetThreadPriority(TIME_CRITICAL) failed");
-        }
-
         let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
         let mut task_index: u32 = 0;
         let handle = AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut task_index as *mut _);
         if handle.is_null() {
             tracing::warn!("Windows: AvSetMmThreadCharacteristicsW(\"Pro Audio\") returned NULL");
+            None
+        } else if AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL) == 0 {
+            tracing::warn!("Windows: AvSetMmThreadPriority(CRITICAL) failed");
+            let _ = AvRevertMmThreadCharacteristics(handle);
+            None
         } else {
             tracing::info!(
-                "Windows: MMCSS \"Pro Audio\" task associated (task_index={task_index})"
+                "Windows: MMCSS \"Pro Audio\" task associated at CRITICAL priority (task_index={task_index})"
             );
-            // Intencional: no llamamos AvRevertMmThreadCharacteristics. El thread
-            // vive hasta el final del streaming; el SO libera el slot MMCSS al
-            // terminar el proceso. Liberarlo dentro del loop sería innecesario.
-            std::mem::forget(handle);
+            Some(MmcssGuard(handle))
         }
     }
 }
@@ -215,7 +221,7 @@ fn sender_thread_main(
     frame_duration: std::time::Duration,
     burst_size: usize,
 ) {
-    set_realtime_priority();
+    let _priority_guard = set_realtime_priority();
     disable_wifi_power_save();
 
     let burst_size = burst_size.max(1); // Minimum 1
@@ -1018,7 +1024,10 @@ async fn run_streamer(
     // Only set RT priority if we're NOT using the dedicated sender thread
     // (the sender thread sets its own RT priority)
     if !has_sender_thread {
+        #[cfg(not(windows))]
         set_realtime_priority();
+        #[cfg(windows)]
+        tracing::warn!("Windows: no dedicated sender thread; MMCSS cannot be retained safely");
     }
 
     // Use absolute deadline scheduling so processing time doesn't cause drift
