@@ -223,6 +223,7 @@ fn sender_thread_main(
     frame_duration: std::time::Duration,
     burst_size: usize,
     metrics: crate::live_policy::SharedDiagnostics,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let _priority_guard = set_realtime_priority();
     #[cfg(not(test))]
@@ -259,8 +260,9 @@ fn sender_thread_main(
     );
 
     loop {
+        if stop.load(Ordering::Acquire) { break; }
         // Receive next message (blocking with timeout for clean shutdown detection)
-        let msg = match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+        let msg = match rx.recv_timeout(std::time::Duration::from_millis(20)) {
             Ok(msg) => msg,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -277,6 +279,7 @@ fn sender_thread_main(
             SenderMessage::Pause => {
                 tracing::debug!("Sender thread: paused");
                 loop {
+                    if stop.load(Ordering::Acquire) { return; }
                     match rx.recv_timeout(std::time::Duration::from_millis(50)) {
                         Ok(SenderMessage::Resume) => {
                             tracing::debug!("Sender thread: resumed");
@@ -484,8 +487,22 @@ pub struct AudioStreamer {
     underruns: Arc<AtomicU64>,
     /// Dedicated sender thread for precise packet timing.
     sender_thread: Option<std::thread::JoinHandle<()>>,
+    sender_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Channel to send packets to the sender thread.
     sender_tx: Option<Sender<SenderMessage>>,
+}
+
+impl Drop for AudioStreamer {
+    fn drop(&mut self) {
+        // Only the owning streamer stops the worker; read/control clones have
+        // neither a task nor a thread handle.
+        if self.task.is_some() || self.sender_thread.is_some() {
+            self.sender_stop.store(true, Ordering::Release);
+            self.state_cache.store(StreamerState::Stopped as u8, Ordering::Release);
+            if let Some(task) = self.task.take() { task.abort(); }
+            self.sender_tx = None;
+        }
+    }
 }
 
 impl Clone for AudioStreamer {
@@ -497,6 +514,7 @@ impl Clone for AudioStreamer {
             timestamp_cache: Arc::clone(&self.timestamp_cache),
             packets_sent: Arc::clone(&self.packets_sent),
             underruns: Arc::clone(&self.underruns),
+            sender_stop: self.sender_stop.clone(),
             sender_thread: None, // Can't clone JoinHandle
             sender_tx: self.sender_tx.clone(),
         }
@@ -535,6 +553,7 @@ impl AudioStreamer {
             packets_sent: Arc::new(AtomicU64::new(0)),
             underruns: Arc::new(AtomicU64::new(0)),
             sender_thread: None,
+            sender_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sender_tx: None,
         }
     }
@@ -620,6 +639,11 @@ impl AudioStreamer {
     }
 
     /// Get current state.
+    /// Allows live retransmit workers to stop polling when their owner exits.
+    pub fn is_finished(&self) -> bool {
+        matches!(self.state(), StreamerState::Stopped | StreamerState::Error)
+    }
+
     pub fn state(&self) -> StreamerState {
         match self.state_cache.load(Ordering::Relaxed) {
             0 => StreamerState::Idle,
@@ -686,6 +710,8 @@ impl AudioStreamer {
                     let burst_size = 1;
 
                     let metrics = inner.metrics.clone();
+                    let sender_stop = self.sender_stop.clone();
+                    sender_stop.store(false, Ordering::Release);
                     let thread = std::thread::Builder::new()
                         .name("rt-sender".into())
                         .spawn(move || {
@@ -695,6 +721,7 @@ impl AudioStreamer {
                                 frame_duration,
                                 burst_size,
                                 metrics,
+                                sender_stop,
                             );
                         })
                         .expect("Failed to spawn sender thread");
@@ -831,6 +858,8 @@ impl AudioStreamer {
                     let burst_size = 1;
 
                     let metrics = inner.metrics.clone();
+                    let sender_stop = self.sender_stop.clone();
+                    sender_stop.store(false, Ordering::Release);
                     let thread = std::thread::Builder::new()
                         .name("rt-sender".into())
                         .spawn(move || {
@@ -840,6 +869,7 @@ impl AudioStreamer {
                                 frame_duration,
                                 burst_size,
                                 metrics,
+                                sender_stop,
                             );
                         })
                         .expect("Failed to spawn sender thread");
@@ -912,6 +942,9 @@ impl AudioStreamer {
 
     /// Stop streaming.
     pub async fn stop(&mut self) -> Result<()> {
+        // Retransmit/control clones may retain tx. Shutdown must not rely on
+        // channel disconnection or delivery of a Stop message to a full queue.
+        self.sender_stop.store(true, Ordering::Release);
         // Set state to Stopped FIRST so run_streamer breaks out of its loop
         // and stops producing into the bounded channel.
         self.state_cache.store(StreamerState::Stopped as u8, Ordering::Relaxed);
@@ -942,6 +975,7 @@ impl AudioStreamer {
         let mut inner = self.inner.lock().await;
         inner.state = StreamerState::Stopped;
         inner.buffer.flush();
+        inner.metrics.encoder_buffer_ms.store(0, Ordering::Relaxed);
         inner.decoder = None;
         inner.live_decoder = None;
         Ok(())
@@ -1550,7 +1584,7 @@ mod live_transport_regressions {
             captured_at: Some(std::time::Instant::now() - Duration::from_secs(1)), max_age: Some(Duration::from_millis(120)) }).unwrap();
         tx.send(SenderMessage::Packet { wire_packets: vec![b"recent".to_vec()], sync_data: None,
             captured_at: Some(std::time::Instant::now()), max_age: Some(Duration::from_millis(120)) }).unwrap();
-        let worker = std::thread::spawn(move || sender_thread_main(rx, vec![target], Duration::from_millis(1), 1, worker_metrics));
+        let worker = std::thread::spawn(move || sender_thread_main(rx, vec![target], Duration::from_millis(1), 1, worker_metrics, Arc::new(std::sync::atomic::AtomicBool::new(false))));
         let mut data = [0; 64];
         let size = receiver.recv(&mut data).unwrap();
         assert_eq!(&data[..size], b"recent");
@@ -1574,6 +1608,7 @@ mod live_transport_regressions {
         streamer.start_live_with_options(decoder, crate::LiveStreamOptions::low_latency()).await.unwrap();
         for _ in 0..50 { sender.try_send(crate::LivePcmFrame { samples: vec![1; 704], channels: 2, sample_rate: 44_100 }); }
         tokio::time::sleep(Duration::from_millis(10)).await;
+        let _control_clone = streamer.clone();
         tokio::time::timeout(Duration::from_secs(1), streamer.stop()).await.unwrap().unwrap();
         assert!(sender.is_closed());
     }

@@ -136,3 +136,48 @@ fn diagnostic_handle_does_not_keep_the_pcm_producer_alive() {
     assert!(decoder.is_eof());
     assert_eq!(diagnostics.snapshot().queued_blocks, 0);
 }
+
+#[test]
+fn diagnostic_handle_does_not_retain_pcm_after_decoder_shutdown() {
+    let (sender, decoder) = LiveAudioDecoder::create_pair(44_100, 2, 7);
+    let diagnostics = sender.diagnostics_handle();
+    assert!(sender.try_send(block(1)));
+    drop(decoder);
+    assert!(sender.is_closed());
+    assert_eq!(diagnostics.snapshot().queued_blocks, 0);
+}
+
+#[tokio::test]
+async fn dropping_owner_marks_control_clone_finished() {
+    let (sender, decoder) =
+        LiveAudioDecoder::create_pair_with_max_age(44_100, 2, 7, Some(Duration::from_millis(120)));
+    for _ in 0..5 {
+        assert!(sender.try_send(block(1)));
+    }
+    let mut streamer = AudioStreamer::new(StreamConfig::default());
+    streamer
+        .start_live_with_options(decoder, LiveStreamOptions::low_latency())
+        .await
+        .unwrap();
+    let control = streamer.clone();
+    drop(streamer);
+    assert!(control.is_finished());
+    drop(control);
+    tokio::task::yield_now().await;
+    assert!(sender.is_closed());
+}
+
+#[tokio::test]
+async fn unprimed_handle_api_can_start_without_waiting_for_an_unavailable_producer() {
+    let (_, decoder) = LiveAudioDecoder::create_pair(44_100, 2, 64);
+    let mut streamer = AudioStreamer::new(StreamConfig::default());
+    let mut options = LiveStreamOptions::default();
+    options.startup_ms = 0;
+    let began = Instant::now();
+    streamer
+        .start_live_with_options(decoder, options)
+        .await
+        .unwrap();
+    assert!(began.elapsed() < Duration::from_millis(200));
+    streamer.stop().await.unwrap();
+}

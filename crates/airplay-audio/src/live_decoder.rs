@@ -379,7 +379,10 @@ impl LiveAudioDecoder {
 }
 
 impl Drop for LiveAudioDecoder {
-    fn drop(&mut self) { self.closed.store(true, std::sync::atomic::Ordering::Release); }
+    fn drop(&mut self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
+        if let LiveInput::Timed(rx) = &self.rx { while rx.try_recv().is_ok() {} }
+    }
 }
 
 #[cfg(test)]

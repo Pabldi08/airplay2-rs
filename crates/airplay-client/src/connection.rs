@@ -1275,6 +1275,7 @@ impl Connection {
             Some(tokio::task::spawn_blocking(move || {
                 tracing::debug!("Control channel thread started for live streaming (5ms poll)");
                 loop {
+                    if streamer_clone.is_finished() { break; }
                     match control_rx_clone.recv_raw_timeout(std::time::Duration::from_millis(5)) {
                         Ok(Some((data, _addr))) => {
                             if data.len() < 4 {
