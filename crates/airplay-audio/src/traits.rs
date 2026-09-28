@@ -71,6 +71,7 @@ mod tests {
                     Ok(Some(AudioFrame {
                         samples: Arc::new(vec![0i16; 704]),
                         timestamp: 0,
+                        captured_at: None,
                     }))
                 }));
 

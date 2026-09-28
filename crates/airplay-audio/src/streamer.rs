@@ -149,6 +149,8 @@ enum SenderMessage {
         /// Pre-serialized sync packet bytes, if sync is needed this frame.
         /// Shared across all targets (sync content is identical for all devices).
         sync_data: Option<Vec<u8>>,
+        captured_at: Option<std::time::Instant>,
+        max_age: Option<Duration>,
     },
     /// Pause: sender thread should stop advancing deadlines and wait for Resume.
     Pause,
@@ -220,8 +222,10 @@ fn sender_thread_main(
     targets: Vec<SendTarget>,
     frame_duration: std::time::Duration,
     burst_size: usize,
+    metrics: crate::live_policy::SharedDiagnostics,
 ) {
     let _priority_guard = set_realtime_priority();
+    #[cfg(not(test))]
     disable_wifi_power_save();
 
     let burst_size = burst_size.max(1); // Minimum 1
@@ -243,7 +247,7 @@ fn sender_thread_main(
 
     // Burst buffer for WiFi/BT coexistence
     // Each entry: (wire_packets per target, optional shared sync data)
-    let mut burst_buffer: Vec<(Vec<Vec<u8>>, Option<Vec<u8>>)> = Vec::with_capacity(burst_size);
+    let mut burst_buffer: Vec<(Vec<Vec<u8>>, Option<Vec<u8>>, Option<std::time::Instant>, Option<Duration>)> = Vec::with_capacity(burst_size);
 
     let target_count = targets.len();
     tracing::info!(
@@ -298,9 +302,9 @@ fn sender_thread_main(
                 { next_deadline = std::time::Instant::now(); }
                 continue;
             }
-            SenderMessage::Packet { wire_packets, sync_data } => {
+            SenderMessage::Packet { wire_packets, sync_data, captured_at, max_age } => {
                 // Buffer packet for burst sending
-                burst_buffer.push((wire_packets, sync_data));
+                burst_buffer.push((wire_packets, sync_data, captured_at, max_age));
 
                 // Only send when we have a full burst (or first packet to initialize timing)
                 if burst_buffer.len() < burst_size && started {
@@ -370,7 +374,12 @@ fn sender_thread_main(
                 last_send = send_time;
 
                 // Send all buffered packets
-                for (wire_packets, sync_data) in burst_buffer.drain(..) {
+                for (wire_packets, sync_data, captured_at, max_age) in burst_buffer.drain(..) {
+                    if crate::live_policy::expired(captured_at, max_age) {
+                        metrics.stale_drops.fetch_add(1, Ordering::Relaxed);
+                        metrics.force_sync.store(true, Ordering::Release);
+                        continue;
+                    }
                     // Send sync packet to ALL targets' control dests
                     if let Some(ref sync) = sync_data {
                         for target in &targets {
@@ -385,13 +394,19 @@ fn sender_thread_main(
                     }
 
                     // Send per-target audio packets
+                    let mut delivered = false;
                     for (i, target) in targets.iter().enumerate() {
                         if let Some(wire_data) = wire_packets.get(i) {
-                            if let Err(e) = target.data_socket.send_to(wire_data, target.data_dest) {
-                                tracing::error!("Failed to send audio packet to {}: {}", target.data_dest, e);
+                            match target.data_socket.send_to(wire_data, target.data_dest) {
+                                Ok(_) => delivered = true,
+                                Err(e) => {
+                                    metrics.send_errors.fetch_add(1, Ordering::Relaxed);
+                                    tracing::error!("Failed to send audio packet to {}: {}", target.data_dest, e);
+                                }
                             }
                         }
                     }
+                    if delivered { metrics.observe_send(captured_at); }
                 }
 
                 // Advance deadline by burst duration
@@ -431,6 +446,8 @@ struct StreamerInner {
     state: StreamerState,
     config: StreamConfig,
     buffer: AudioBuffer,
+    live_options: crate::LiveStreamOptions,
+    metrics: crate::live_policy::SharedDiagnostics,
     rtp_senders: Vec<RtpSender>,
     current_timestamp: u64,
     last_sync_rtp: u32,
@@ -495,6 +512,8 @@ impl AudioStreamer {
                 state: StreamerState::Idle,
                 config,
                 buffer: AudioBuffer::new(audio_format, 2000),
+                live_options: crate::LiveStreamOptions::default(),
+                metrics: Arc::new(crate::LiveDiagnostics::default()),
                 rtp_senders: Vec::new(),
                 current_timestamp: 0,
                 last_sync_rtp: 0,
@@ -666,6 +685,7 @@ impl AudioStreamer {
                     // - burst_size=4: 32ms gaps (may cause burst packet loss)
                     let burst_size = 1;
 
+                    let metrics = inner.metrics.clone();
                     let thread = std::thread::Builder::new()
                         .name("rt-sender".into())
                         .spawn(move || {
@@ -674,6 +694,7 @@ impl AudioStreamer {
                                 targets,
                                 frame_duration,
                                 burst_size,
+                                metrics,
                             );
                         })
                         .expect("Failed to spawn sender thread");
@@ -714,9 +735,17 @@ impl AudioStreamer {
     /// PCM frames from a channel, enabling streaming from external sources like
     /// Bluetooth audio capture.
     pub async fn start_live(&mut self, live_decoder: LiveAudioDecoder) -> Result<()> {
+        self.start_live_with_options(live_decoder, crate::LiveStreamOptions::default()).await
+    }
+
+    pub async fn start_live_with_options(&mut self, live_decoder: LiveAudioDecoder, options: crate::LiveStreamOptions) -> Result<()> {
+        options.validate()?;
         let frame_duration_ns;
         {
             let mut inner = self.inner.lock().await;
+            inner.metrics = live_decoder.metrics();
+            inner.live_options = options;
+            inner.buffer = AudioBuffer::new(inner.config.audio_format, options.buffer_ms);
             inner.live_decoder = Some(live_decoder);
             inner.decoder = None; // Clear file decoder if any
             inner.encoder = Some(create_encoder(inner.config.audio_format.clone())?);
@@ -729,12 +758,11 @@ impl AudioStreamer {
 
         // For live streaming, wait for initial buffer fill before streaming.
         // This prevents startup artifacts from sending packets before we have
-        // enough audio data buffered. Target ~500ms of buffer (about 60 packets
-        // at 352 frames/packet, 44.1kHz).
+        // enough audio data buffered. The local policy controls pre-roll;
+        // callers must feed the decoder while awaiting this method.
         tracing::info!("Live streaming: waiting for initial buffer fill...");
         let buffer_start = std::time::Instant::now();
-        let max_wait = std::time::Duration::from_secs(5);
-        let target_fill_pct = 50.0; // Wait for 50% of 2000ms buffer = 1000ms
+        let max_wait = options.startup_timeout;
 
         loop {
             // Try to decode some frames into the buffer
@@ -744,7 +772,7 @@ impl AudioStreamer {
                 let fill_pct = guard.buffer.fill_percentage();
                 let frame_count = guard.buffer.len();
 
-                if fill_pct >= target_fill_pct {
+                if guard.buffer.buffered_ms() >= options.startup_ms {
                     tracing::info!(
                         "Live streaming: buffer ready at {:.1}% ({} frames), starting playback",
                         fill_pct, frame_count
@@ -777,7 +805,7 @@ impl AudioStreamer {
 
         if self.task.is_none() {
             // Set up the dedicated sender thread with cloned sockets
-            let (tx, rx) = bounded::<SenderMessage>(8);
+            let (tx, rx) = bounded::<SenderMessage>(options.sender_capacity);
             let frame_duration = std::time::Duration::from_nanos(frame_duration_ns);
 
             {
@@ -802,6 +830,7 @@ impl AudioStreamer {
                 if !targets.is_empty() {
                     let burst_size = 1;
 
+                    let metrics = inner.metrics.clone();
                     let thread = std::thread::Builder::new()
                         .name("rt-sender".into())
                         .spawn(move || {
@@ -810,6 +839,7 @@ impl AudioStreamer {
                                 targets,
                                 frame_duration,
                                 burst_size,
+                                metrics,
                             );
                         })
                         .expect("Failed to spawn sender thread");
@@ -886,6 +916,13 @@ impl AudioStreamer {
         // and stops producing into the bounded channel.
         self.state_cache.store(StreamerState::Stopped as u8, Ordering::Relaxed);
 
+        // Cancel the producer before joining the sender. It owns a channel
+        // clone, so dropping only self.sender_tx cannot disconnect a full queue.
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+
         // Signal sender thread to stop
         if let Some(ref tx) = self.sender_tx {
             let _ = tx.try_send(SenderMessage::Stop);
@@ -900,11 +937,6 @@ impl AudioStreamer {
             let _ = tokio::task::spawn_blocking(move || {
                 let _ = handle.join();
             }).await;
-        }
-
-        // Cancel the run_streamer task if still running
-        if let Some(task) = self.task.take() {
-            task.abort();
         }
 
         let mut inner = self.inner.lock().await;
@@ -975,6 +1007,7 @@ fn decode_some_inner(inner: &mut StreamerInner) -> Result<()> {
     // Very small batches ensure minimal interference with precise timing.
     // With 2ms timeout per frame, worst case is ~6ms blocking.
     for _ in 0..3 {
+        if inner.buffer.is_full() { break; }
         // Try live decoder first (for Bluetooth/external sources), then file decoder
         let frame = if let Some(ref mut live_decoder) = inner.live_decoder {
             live_decoder.decode_resampled(&format, frames_per_packet)?
@@ -985,7 +1018,12 @@ fn decode_some_inner(inner: &mut StreamerInner) -> Result<()> {
         };
 
         if let Some(frame) = frame {
-            let audio_frame = crate::AudioFrame::new(frame.samples, frame.timestamp);
+            let mut audio_frame = crate::AudioFrame::new(frame.samples, frame.timestamp);
+            audio_frame.captured_at = inner.live_decoder.as_ref().and_then(|d| d.packet_captured_at());
+            if crate::live_policy::expired(audio_frame.captured_at, inner.live_options.max_age) {
+                inner.metrics.stale_drops.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             inner
                 .buffer
                 .push(audio_frame)
@@ -1055,10 +1093,12 @@ async fn run_streamer(
                     guard.clock_offset = Some(latest);
                 }
             }
-            // Keep buffer above 40% but don't decode too aggressively
-            // to avoid blocking the send loop with decode operations.
-            // With 50% initial fill, we have plenty of headroom.
-            if guard.buffer.fill_percentage() < 40.0 {
+            // Preserve file buffering; live input uses an independent local
+            // policy so receiver latency never silently configures these queues.
+            let refill = if guard.live_decoder.is_some() {
+                guard.buffer.buffered_ms() < guard.live_options.refill_ms
+            } else { guard.buffer.fill_percentage() < 40.0 };
+            if refill {
                 let decode_start = Instant::now();
                 decode_some_inner(&mut guard)?;
                 let decode_elapsed = decode_start.elapsed();
@@ -1072,7 +1112,10 @@ async fn run_streamer(
 
             // Check for recovery from Buffering state
             if guard.state == StreamerState::Buffering {
-                if guard.buffer.fill_percentage() > 10.0 {
+                let ready = if guard.live_decoder.is_some() {
+                    guard.buffer.buffered_ms() >= guard.live_options.resume_ms
+                } else { guard.buffer.fill_percentage() > 10.0 };
+                if ready {
                     guard.state = StreamerState::Streaming;
                     state_cache.store(StreamerState::Streaming as u8, Ordering::Relaxed);
                 } else {
@@ -1100,6 +1143,12 @@ async fn run_streamer(
                 }
             }
 
+            while guard.buffer.peek().is_some_and(|f| crate::live_policy::expired(f.captured_at, guard.live_options.max_age)) {
+                guard.buffer.pop();
+                guard.metrics.stale_drops.fetch_add(1, Ordering::Relaxed);
+                guard.metrics.force_sync.store(true, Ordering::Release);
+            }
+            guard.metrics.encoder_buffer_ms.store(guard.buffer.buffered_ms() as u64, Ordering::Relaxed);
             let frame = guard.buffer.pop();
             if let Some(frame) = frame {
                 // Diagnostic: log PCM sample energy for first few frames
@@ -1180,6 +1229,10 @@ async fn run_streamer(
                 let render_adjusted = adjusted + guard.render_delay_ns;
                 let ntp = unix_to_ntp(render_adjusted);
 
+                if guard.live_options.max_age.is_some() && guard.metrics.packets_sent.load(Ordering::Relaxed) == 0
+                    && guard.metrics.force_sync.load(Ordering::Acquire) {
+                    guard.first_packet_sent = false;
+                }
                 // Set marker bit on first audio packet (required by some receivers)
                 let first_packet = !guard.first_packet_sent;
                 let marker = first_packet;
@@ -1187,10 +1240,12 @@ async fn run_streamer(
                     tracing::info!("Sending first audio packet with marker bit set");
                 }
 
-                let rtp_ts = packet.timestamp as u32;
+                let rtp_ts = if guard.live_options.max_age.is_some() { frame.timestamp as u32 } else { packet.timestamp as u32 };
 
                 // Determine if sync is needed BEFORE borrowing rtp_sender
-                let need_sync = first_packet || last_sync_rtp == 0
+                let need_sync = guard.metrics.force_sync.swap(false, Ordering::AcqRel)
+                    || (guard.live_options.max_age.is_some() && guard.current_timestamp as u32 != rtp_ts)
+                    || first_packet || last_sync_rtp == 0
                     || rtp_ts.wrapping_sub(last_sync_rtp) >= sample_rate;
 
                 // Extract PTP sync mode state before borrowing rtp_sender
@@ -1233,14 +1288,16 @@ async fn run_streamer(
                         if first_packet {
                             guard.first_packet_sent = true;
                         }
-                        guard.current_timestamp = packet.timestamp + packet.samples as u64;
+                        guard.current_timestamp = rtp_ts as u64 + packet.samples as u64;
                         timestamp_cache.store(guard.current_timestamp, Ordering::Relaxed);
                         packets_sent_counter.fetch_add(1, Ordering::Relaxed);
 
                         // Drop the mutex guard first so other async tasks can proceed
+                        let captured_at = frame.captured_at;
+                        let max_age = guard.live_options.max_age;
                         drop(guard);
                         let tx_clone = tx.clone();
-                        let msg = SenderMessage::Packet { wire_packets, sync_data };
+                        let msg = SenderMessage::Packet { wire_packets, sync_data, captured_at, max_age };
                         let send_result = tokio::task::spawn_blocking(move || {
                             tx_clone.send(msg)
                         }).await;
@@ -1288,13 +1345,14 @@ async fn run_streamer(
                         if first_packet {
                             guard.first_packet_sent = true;
                         }
-                        guard.current_timestamp = packet.timestamp + packet.samples as u64;
+                        guard.current_timestamp = rtp_ts as u64 + packet.samples as u64;
                         timestamp_cache.store(guard.current_timestamp, Ordering::Relaxed);
                         packets_sent_counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             } else {
                 let count = underrun_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                guard.metrics.underruns.fetch_add(1, Ordering::Relaxed);
                 if count <= 5 || count % 50 == 0 {
                     tracing::warn!("Buffer underrun #{} (buffer empty, packet skipped)", count);
                 }
@@ -1473,5 +1531,50 @@ mod tests {
             let pos = streamer.position();
             assert_eq!(pos, 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod live_transport_regressions {
+    use super::*;
+    #[test]
+    fn stalled_sender_discards_expired_wire_audio_and_measures_only_sent_packets() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let data_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target = SendTarget { data_socket, data_dest: receiver.local_addr().unwrap(), control_socket: None, control_dest: None };
+        let (tx, rx) = bounded(2);
+        let metrics = Arc::new(crate::LiveDiagnostics::default());
+        let worker_metrics = metrics.clone();
+        tx.send(SenderMessage::Packet { wire_packets: vec![b"expired".to_vec()], sync_data: None,
+            captured_at: Some(std::time::Instant::now() - Duration::from_secs(1)), max_age: Some(Duration::from_millis(120)) }).unwrap();
+        tx.send(SenderMessage::Packet { wire_packets: vec![b"recent".to_vec()], sync_data: None,
+            captured_at: Some(std::time::Instant::now()), max_age: Some(Duration::from_millis(120)) }).unwrap();
+        let worker = std::thread::spawn(move || sender_thread_main(rx, vec![target], Duration::from_millis(1), 1, worker_metrics));
+        let mut data = [0; 64];
+        let size = receiver.recv(&mut data).unwrap();
+        assert_eq!(&data[..size], b"recent");
+        drop(tx);
+        worker.join().unwrap();
+        let stats = metrics.snapshot(0);
+        assert_eq!(stats.stale_drops, 1);
+        assert_eq!(stats.packets_sent, 1);
+        assert!(stats.capture_to_send_p95_us.unwrap() <= 120_000);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_live_udp_sender_releases_producer_and_decoder() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut rtp = RtpSender::new(receiver.local_addr().unwrap(), 42);
+        rtp.bind(0).unwrap();
+        let (sender, decoder) = LiveAudioDecoder::create_pair_with_max_age(44_100, 2, 7, Some(Duration::from_millis(120)));
+        for _ in 0..7 { assert!(sender.try_send(crate::LivePcmFrame { samples: vec![1; 704], channels: 2, sample_rate: 44_100 })); }
+        let mut streamer = AudioStreamer::new(StreamConfig::default());
+        streamer.set_rtp_sender(rtp).await;
+        streamer.start_live_with_options(decoder, crate::LiveStreamOptions::low_latency()).await.unwrap();
+        for _ in 0..50 { sender.try_send(crate::LivePcmFrame { samples: vec![1; 704], channels: 2, sample_rate: 44_100 }); }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::timeout(Duration::from_secs(1), streamer.stop()).await.unwrap().unwrap();
+        assert!(sender.is_closed());
     }
 }

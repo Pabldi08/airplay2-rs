@@ -11,6 +11,8 @@ pub struct AudioFrame {
     pub samples: Arc<Vec<i16>>,
     /// Timestamp in samples from start.
     pub timestamp: u64,
+    /// Monotonic delivery time for live input; absent for file playback.
+    pub captured_at: Option<std::time::Instant>,
 }
 
 impl AudioFrame {
@@ -18,7 +20,8 @@ impl AudioFrame {
     pub fn new(samples: Vec<i16>, timestamp: u64) -> Self {
         Self {
             samples: Arc::new(samples),
-            timestamp
+            timestamp,
+            captured_at: None,
         }
     }
 

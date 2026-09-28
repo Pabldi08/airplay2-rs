@@ -1,0 +1,19 @@
+name: Windows live audio regression tests
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Live audio and UDP regression tests
+        run: cargo test -p airplay-audio --lib --test live_latency_policy --locked
+      - name: Check client integration
+        run: cargo check -p airplay-client --locked

@@ -1210,6 +1210,10 @@ impl Connection {
     /// This is similar to `start_streaming()` but uses a `LiveAudioDecoder` that
     /// receives PCM frames from a channel, enabling streaming from external sources.
     pub async fn start_streaming_live(&mut self, live_decoder: LiveAudioDecoder) -> Result<()> {
+        self.start_streaming_live_with_options(live_decoder, airplay_audio::LiveStreamOptions::default()).await
+    }
+
+    pub async fn start_streaming_live_with_options(&mut self, live_decoder: LiveAudioDecoder, options: airplay_audio::LiveStreamOptions) -> Result<()> {
         // Ensure setup is complete
         if self.session.state() != SessionState::Ready {
             self.setup().await?;
@@ -1250,7 +1254,7 @@ impl Connection {
         }
 
         // Start live streaming
-        streamer.start_live(live_decoder).await?;
+        streamer.start_live_with_options(live_decoder, options).await?;
 
         self.session.start_playing()?;
 
