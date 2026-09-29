@@ -132,6 +132,15 @@ impl RtspSession {
         true
     }
 
+    /// Read actual AirPlay 2 volume from /info, in the existing normalized gain convention.
+    pub fn reported_volume(body: &[u8]) -> Option<f32> {
+        let info = plist::Value::from_reader(std::io::Cursor::new(body)).ok()?;
+        let value = info.as_dictionary()?.get("initialVolume")?;
+        let db = value.as_real().or_else(|| value.as_signed_integer().map(|v| v as f64))?;
+        if !db.is_finite() || db > 0.0 { return None; }
+        Some(if db <= -144.0 { 0.0 } else { 10.0_f64.powf(db / 20.0).clamp(0.0, 1.0) as f32 })
+    }
+
     /// Override the client device ID used in SETUP.
     pub fn set_client_device_id(&mut self, device_id: String) {
         self.client_device_id = device_id;
@@ -564,6 +573,24 @@ mod tests {
         assert_eq!(session.device().id, original_id);
         assert!(!session.merge_receiver_info(b"invalid plist"));
         assert_eq!(session.device().model, "AVR-X2800H");
+    }
+
+    #[test]
+    fn reports_info_volume_and_preserves_the_existing_gain_scale() {
+        let read = |value| {
+            let mut dictionary = plist::Dictionary::new();
+            dictionary.insert("initialVolume".into(), value);
+            let mut body = Vec::new();
+            plist::Value::Dictionary(dictionary).to_writer_binary(&mut body).unwrap();
+            RtspSession::reported_volume(&body)
+        };
+        assert_eq!(read(plist::Value::Real(-144.0)), Some(0.0));
+        assert_eq!(read(plist::Value::Integer(0.into())), Some(1.0));
+        assert!((read(plist::Value::Real(-6.02)).unwrap() - 0.5).abs() < 0.001);
+        assert_eq!(read(plist::Value::Real(f64::NAN)), None);
+        assert_eq!(read(plist::Value::Real(10.0)), None);
+        assert_eq!(read(plist::Value::String("invalid".into())), None);
+        assert_eq!(RtspSession::reported_volume(b"invalid plist"), None);
     }
     use airplay_core::device::DeviceId;
     use airplay_core::features::Features;

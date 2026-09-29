@@ -1520,12 +1520,12 @@ impl Connection {
 
     /// Read the receiver's real volume. Unsupported receivers return None.
     pub async fn read_volume(&mut self) -> Result<Option<f32>> {
-        let request = RtspRequest::new(airplay_rtsp::RtspMethod::GetParameter, self.session.request_uri())
-            .header("Content-Type", "text/parameters").body(b"volume\r\n".to_vec());
-        let response = self.rtsp.send(request).await?;
+        // AirPlay 2 reports current endpoint volume as initialVolume in /info.
+        // Use the same supported request already used before pairing.
+        let response = self.rtsp.send(RtspRequest::get_info()).await?;
         if response.status_code == 405 || response.status_code == 501 { return Ok(None); }
         if response.status_code != 200 { return Err(RtspError::InvalidResponse(format!("volume read status {}", response.status_code)).into()); }
-        let value = response.body.as_deref().and_then(parse_receiver_volume);
+        let value = response.body.as_deref().and_then(RtspSession::reported_volume);
         if let Some(volume) = value { self.volume = volume; }
         Ok(value)
     }
@@ -2490,23 +2490,5 @@ mod tests {
             let stopped = PlaybackState::Stopped;
             assert_eq!(stopped, PlaybackState::Stopped);
         }
-    }
-}
-
-fn parse_receiver_volume(body: &[u8]) -> Option<f32> {
-    let text = std::str::from_utf8(body).ok()?;
-    let db: f32 = text.lines().find_map(|line| { let (key, value) = line.split_once(':')?; (key.trim() == "volume").then(|| value.trim().parse().ok()).flatten() })?;
-    if !db.is_finite() || db > 0.0 { return None; }
-    Some(if db <= -144.0 { 0.0 } else { 10.0_f32.powf(db / 20.0).clamp(0.0, 1.0) })
-}
-#[cfg(test)]
-mod receiver_volume_tests {
-    use super::*;
-    #[test] fn parses_real_volume_and_rejects_invalid_values() {
-        assert_eq!(parse_receiver_volume(b"volume: -144.00\r\n"), Some(0.0));
-        assert_eq!(parse_receiver_volume(b"volume: 0.00\r\n"), Some(1.0));
-        assert!((parse_receiver_volume(b"volume: -6.02\r\n").unwrap() - 0.5).abs() < 0.001);
-        assert_eq!(parse_receiver_volume(b"volume: NaN"), None);
-        assert_eq!(parse_receiver_volume(b"volume: 10"), None);
     }
 }
