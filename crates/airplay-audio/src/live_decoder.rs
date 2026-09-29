@@ -21,42 +21,94 @@ pub struct LivePcmFrame {
     pub sample_rate: u32,
 }
 
-/// Sender for pushing live PCM frames to a LiveAudioDecoder.
+#[derive(Clone)]
+struct TimedPcmFrame { pcm: LivePcmFrame, captured_at: std::time::Instant }
+
+/// Sender with optional oldest-first eviction for fixed-size live PCM blocks.
+#[derive(Clone)]
 pub struct LiveFrameSender {
-    tx: Sender<LivePcmFrame>,
+    tx: Sender<TimedPcmFrame>,
+    eviction: Receiver<TimedPcmFrame>,
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    metrics: crate::live_policy::SharedDiagnostics,
+    max_age: Option<Duration>,
 }
 
 impl LiveFrameSender {
-    /// Send a frame of PCM audio.
-    ///
-    /// Returns true if the frame was sent, false if the channel is full.
     pub fn try_send(&self, frame: LivePcmFrame) -> bool {
-        match self.tx.try_send(frame) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => {
-                tracing::debug!("Live audio channel full, dropping frame");
-                false
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                tracing::debug!("Live audio channel disconnected");
-                false
+        self.try_send_at(frame, std::time::Instant::now())
+    }
+
+    /// Timestamp is monotonic capture delivery time, not acoustic presentation.
+    pub fn try_send_at(&self, frame: LivePcmFrame, captured_at: std::time::Instant) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.is_closed() { return false; }
+        if crate::live_policy::expired(Some(captured_at), self.max_age) {
+            self.metrics.stale_drops.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let mut pending = TimedPcmFrame { pcm: frame, captured_at };
+        loop {
+            match self.tx.try_send(pending) {
+                Ok(()) => return true,
+                Err(TrySendError::Full(frame)) => {
+                    pending = frame;
+                    if self.max_age.is_none() {
+                        self.metrics.queue_drops.fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    }
+                    if let Ok(evicted) = self.eviction.try_recv() {
+                        self.metrics.queue_drops.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.evicted_samples.fetch_add((evicted.pcm.samples.len() / evicted.pcm.channels.max(1) as usize) as u64, Ordering::Relaxed);
+                        self.metrics.force_sync.store(true, Ordering::Release);
+                    }
+                    if self.is_closed() { return false; }
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
             }
         }
     }
 
-    /// Send a frame, blocking if the channel is full.
     pub fn send(&self, frame: LivePcmFrame) -> bool {
-        self.tx.send(frame).is_ok()
+        if self.max_age.is_some() { return self.try_send(frame); }
+        let mut pending = TimedPcmFrame { pcm: frame, captured_at: std::time::Instant::now() };
+        while !self.is_closed() {
+            match self.tx.send_timeout(pending, Duration::from_millis(10)) {
+                Ok(()) => return true,
+                Err(crossbeam_channel::SendTimeoutError::Timeout(frame)) => pending = frame,
+                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return false,
+            }
+        }
+        false
     }
+    pub fn capacity(&self) -> Option<usize> { self.tx.capacity() }
+    pub fn is_full(&self) -> bool { self.tx.is_full() }
+    pub fn is_closed(&self) -> bool { self.closed.load(std::sync::atomic::Ordering::Acquire) }
+    pub fn diagnostics(&self) -> crate::LiveDiagnosticsSnapshot { self.metrics.snapshot(self.tx.len()) }
+    pub fn diagnostics_handle(&self) -> LiveDiagnosticsHandle { LiveDiagnosticsHandle { queue: self.eviction.clone(), metrics: self.metrics.clone() } }
+}
 
-    /// Get the channel capacity.
-    pub fn capacity(&self) -> Option<usize> {
-        self.tx.capacity()
-    }
+/// Read-only diagnostics retains no producer, so capture shutdown still signals EOF.
+#[derive(Clone)]
+pub struct LiveDiagnosticsHandle {
+    queue: Receiver<TimedPcmFrame>,
+    metrics: crate::live_policy::SharedDiagnostics,
+}
+impl LiveDiagnosticsHandle {
+    pub fn snapshot(&self) -> crate::LiveDiagnosticsSnapshot { self.metrics.snapshot(self.queue.len()) }
+}
 
-    /// Check if the channel is full.
-    pub fn is_full(&self) -> bool {
-        self.tx.is_full()
+enum LiveInput {
+    External(Receiver<LivePcmFrame>),
+    Timed(Receiver<TimedPcmFrame>),
+}
+impl LiveInput {
+    fn is_empty(&self) -> bool { match self { Self::External(rx) => rx.is_empty(), Self::Timed(rx) => rx.is_empty() } }
+    fn recv_timeout(&self, timeout: Duration) -> std::result::Result<TimedPcmFrame, crossbeam_channel::RecvTimeoutError> {
+        match self {
+            Self::Timed(rx) => rx.recv_timeout(timeout),
+            Self::External(rx) => rx.recv_timeout(timeout).map(|pcm| TimedPcmFrame { pcm, captured_at: std::time::Instant::now() }),
+        }
     }
 }
 
@@ -65,7 +117,15 @@ impl LiveFrameSender {
 /// This provides a decoder-like interface compatible with AudioStreamer,
 /// allowing live audio sources to be streamed over AirPlay.
 pub struct LiveAudioDecoder {
-    rx: Receiver<LivePcmFrame>,
+    rx: LiveInput,
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    metrics: crate::live_policy::SharedDiagnostics,
+    max_age: Option<Duration>,
+    packet_captured_at: Option<std::time::Instant>,
+    residual_captured_at: Option<std::time::Instant>,
+    last_received_at: Option<std::time::Instant>,
+    output_position: u64,
+    accounted_evictions: u64,
     sample_rate: u32,
     channels: u8,
     position_samples: u64,
@@ -86,7 +146,15 @@ impl LiveAudioDecoder {
     /// running and sending buffered frames even when no new data is available.
     pub fn new(rx: Receiver<LivePcmFrame>, sample_rate: u32, channels: u8) -> Self {
         Self {
-            rx,
+            rx: LiveInput::External(rx),
+            closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metrics: std::sync::Arc::new(crate::LiveDiagnostics::default()),
+            max_age: None,
+            packet_captured_at: None,
+            residual_captured_at: None,
+            last_received_at: None,
+            output_position: 0,
+            accounted_evictions: 0,
             sample_rate,
             channels,
             position_samples: 0,
@@ -102,11 +170,25 @@ impl LiveAudioDecoder {
     /// The sender can be used to push PCM frames to the decoder.
     /// Channel capacity controls buffering (typically 8-16 frames).
     pub fn create_pair(sample_rate: u32, channels: u8, capacity: usize) -> (LiveFrameSender, Self) {
-        let (tx, rx) = bounded::<LivePcmFrame>(capacity);
-        let sender = LiveFrameSender { tx };
-        let decoder = Self::new(rx, sample_rate, channels);
+        Self::create_pair_with_max_age(sample_rate, channels, capacity, None)
+    }
+
+    pub fn create_pair_with_max_age(sample_rate: u32, channels: u8, capacity: usize, max_age: Option<Duration>) -> (LiveFrameSender, Self) {
+        let (tx, rx) = bounded::<TimedPcmFrame>(capacity.max(1));
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let metrics = std::sync::Arc::new(crate::LiveDiagnostics::default());
+        let sender = LiveFrameSender { tx, eviction: rx.clone(), closed: closed.clone(), metrics: metrics.clone(), max_age };
+        let (_, external) = bounded(1);
+        let mut decoder = Self::new(external, sample_rate, channels);
+        decoder.rx = LiveInput::Timed(rx);
+        decoder.closed = closed;
+        decoder.metrics = metrics;
+        decoder.max_age = max_age;
         (sender, decoder)
     }
+
+    pub(crate) fn metrics(&self) -> crate::live_policy::SharedDiagnostics { self.metrics.clone() }
+    pub(crate) fn packet_captured_at(&self) -> Option<std::time::Instant> { self.packet_captured_at }
 
     /// Set the receive timeout.
     pub fn set_recv_timeout(&mut self, timeout: Duration) {
@@ -152,8 +234,27 @@ impl LiveAudioDecoder {
             return Ok(None);
         }
 
-        match self.rx.recv_timeout(self.recv_timeout) {
-            Ok(frame) => {
+        let evicted = self.metrics.evicted_samples.load(std::sync::atomic::Ordering::Acquire);
+        let skipped = evicted.saturating_sub(self.accounted_evictions);
+        self.position_samples += skipped;
+        self.output_position += skipped;
+        self.accounted_evictions = evicted;
+        let deadline = std::time::Instant::now() + self.recv_timeout;
+        loop {
+        match self.rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(timed) => {
+                let frame = timed.pcm;
+                if frame.channels == 0 || frame.sample_rate == 0 { continue; }
+                self.metrics.observe_queue_age(timed.captured_at);
+                if crate::live_policy::expired(Some(timed.captured_at), self.max_age) {
+                    let skipped = (frame.samples.len() / frame.channels as usize) as u64;
+                    self.position_samples += skipped;
+                    self.output_position += skipped;
+                    self.metrics.stale_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if std::time::Instant::now() >= deadline { return Ok(None); }
+                    continue;
+                }
+                self.last_received_at = Some(timed.captured_at);
                 let num_frames = frame.samples.len() / frame.channels as usize;
                 let decoded = DecodedFrame {
                     samples: frame.samples,
@@ -162,19 +263,20 @@ impl LiveAudioDecoder {
                     timestamp: self.position_samples,
                 };
                 self.position_samples += num_frames as u64;
-                Ok(Some(decoded))
+                return Ok(Some(decoded));
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // Timeout - no data available but stream may continue
                 tracing::trace!("Live decoder: receive timeout (no data)");
-                Ok(None)
+                return Ok(None);
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 // Channel disconnected - mark EOF
                 tracing::debug!("Live decoder: channel disconnected, marking EOF");
                 self.eof = true;
-                Ok(None)
+                return Ok(None);
             }
+        }
         }
     }
 
@@ -200,6 +302,13 @@ impl LiveAudioDecoder {
         }
 
         // Start with any leftover samples from previous call
+        if crate::live_policy::expired(self.residual_captured_at, self.max_age) {
+            self.output_position += (self.residual_samples.len() / target_format.channels as usize) as u64;
+            self.residual_samples.clear();
+            self.residual_captured_at = None;
+            self.metrics.stale_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut collected_at = self.residual_captured_at.take();
         let mut collected_samples = std::mem::take(&mut self.residual_samples);
         let target_samples = frames_per_packet * target_format.channels as usize;
 
@@ -207,6 +316,7 @@ impl LiveAudioDecoder {
         while collected_samples.len() < target_samples {
             match self.decode_frame()? {
                 Some(frame) => {
+                    collected_at = collected_at.or(self.last_received_at);
                     if source_rate == target_rate {
                         collected_samples.extend(frame.samples);
                     } else {
@@ -227,6 +337,7 @@ impl LiveAudioDecoder {
                     // back to residual instead of padding with silence (which
                     // causes audible pops). Next call will pick these up.
                     self.residual_samples = collected_samples;
+                    self.residual_captured_at = collected_at;
                     return Ok(None);
                 }
             }
@@ -239,6 +350,7 @@ impl LiveAudioDecoder {
         // Save excess samples for next call
         if collected_samples.len() > target_samples {
             self.residual_samples = collected_samples[target_samples..].to_vec();
+            self.residual_captured_at = collected_at.map(|at| at + Duration::from_secs_f64(frames_per_packet as f64 / target_rate as f64));
             collected_samples.truncate(target_samples);
         }
 
@@ -249,17 +361,27 @@ impl LiveAudioDecoder {
             self.position_samples
         };
 
+        let packet_position = self.output_position;
+        self.output_position += frames_per_packet as u64;
+        self.packet_captured_at = collected_at;
         Ok(Some(DecodedFrame {
             samples: collected_samples,
             channels: target_format.channels,
             sample_rate: target_rate,
-            timestamp: scaled_timestamp,
+            timestamp: if self.max_age.is_some() { packet_position } else { scaled_timestamp },
         }))
     }
 
     /// Check if at end of stream.
     pub fn is_eof(&self) -> bool {
         self.eof && self.rx.is_empty()
+    }
+}
+
+impl Drop for LiveAudioDecoder {
+    fn drop(&mut self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
+        if let LiveInput::Timed(rx) = &self.rx { while rx.try_recv().is_ok() {} }
     }
 }
 
