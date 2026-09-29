@@ -402,6 +402,8 @@ pub struct RtpSender {
     first_sync_sent: bool,
     /// Ring buffer of recently sent serialized packets, indexed by (sequence % PACKET_HISTORY_SIZE).
     packet_history: Vec<Option<Vec<u8>>>,
+    packet_created_at: Vec<Option<std::time::Instant>>,
+    retransmit_max_age: Option<std::time::Duration>,
 }
 
 impl RtpSender {
@@ -423,8 +425,12 @@ impl RtpSender {
             sync_sequence: 0,
             first_sync_sent: false,
             packet_history,
+            packet_created_at: vec![None; PACKET_HISTORY_SIZE],
+            retransmit_max_age: None,
         }
     }
+
+    pub fn set_retransmit_max_age(&mut self, max_age: Option<std::time::Duration>) { self.retransmit_max_age = max_age; }
 
     /// Set control port destination for sync packets.
     pub fn set_control_dest(&mut self, dest: SocketAddr) {
@@ -538,6 +544,7 @@ impl RtpSender {
         // Store serialized packet in history for retransmission (move instead of clone)
         let idx = self.sequence as usize % PACKET_HISTORY_SIZE;
         self.packet_history[idx] = Some(serialized);
+        self.packet_created_at[idx] = Some(std::time::Instant::now());
 
         tracing::debug!("Audio packet prepared: seq={}, ts={}, len={}", self.sequence, timestamp, payload.len());
         self.sequence = self.sequence.wrapping_add(1);
@@ -829,6 +836,7 @@ impl RtpSender {
             let seq = request.first_sequence.wrapping_add(i);
             let idx = seq as usize % PACKET_HISTORY_SIZE;
 
+            if self.retransmit_max_age.is_some_and(|max| self.packet_created_at[idx].is_none_or(|at| at.elapsed() > max)) { continue; }
             if let Some(ref original) = self.packet_history[idx] {
                 // Verify the stored packet has the right sequence number
                 if original.len() >= 4 {
@@ -1601,5 +1609,22 @@ mod tests {
             let result = sender.prepare_ptp_sync(0, 0, 0, &clock_id).unwrap();
             assert!(result.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod retransmit_expiry_tests {
+    use super::*;
+    #[test]
+    fn expired_retransmit_preserves_wire_packet_and_next_sequence() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut sender = RtpSender::new(receiver.local_addr().unwrap(), 0);
+        sender.bind(0).unwrap();
+        sender.set_retransmit_max_age(Some(std::time::Duration::from_millis(120)));
+        let wire = sender.prepare_audio(96, 352, b"audio", true).unwrap();
+        sender.packet_created_at[0] = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        assert_eq!(sender.handle_retransmit(&RetransmitRequest { first_sequence: 0, count: 1 }).unwrap(), 0);
+        assert_eq!(sender.sequence, 1);
+        assert_eq!(sender.packet_history[0].as_ref(), Some(&wire));
     }
 }

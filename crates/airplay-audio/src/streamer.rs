@@ -1613,3 +1613,41 @@ mod live_transport_regressions {
         assert!(sender.is_closed());
     }
 }
+
+#[cfg(test)]
+mod group_live_regressions {
+    use super::*;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn group_shares_rtp_timeline_but_uses_distinct_receiver_keys() {
+        use crate::cipher::ChaChaPacketCipher;
+        use airplay_crypto::chacha::AudioCipher;
+        let sockets = [UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap()];
+        let mut targets = Vec::new();
+        for (index, socket) in sockets.iter().enumerate() {
+            socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut target = RtpSender::new(socket.local_addr().unwrap(), 0);
+            target.bind(0).unwrap();
+            target.set_cipher(Box::new(ChaChaPacketCipher::new(AudioCipher::new([index as u8 + 1; 32]))));
+            targets.push(target);
+        }
+        let (producer, decoder) = LiveAudioDecoder::create_pair_with_max_age(44_100, 2, 7, Some(Duration::from_millis(120)));
+        for _ in 0..7 { assert!(producer.try_send(crate::LivePcmFrame { samples: vec![1000; 704], channels: 2, sample_rate: 44100 })); }
+        let mut streamer = AudioStreamer::new(StreamConfig::default());
+        streamer.set_rtp_senders(targets).await;
+        streamer.set_ptp_sync_mode([9; 8]).await;
+        streamer.start_live_with_options(decoder, crate::LiveStreamOptions::low_latency()).await.unwrap();
+        let mut previous_nonce = None;
+        for _ in 0..5 {
+            let mut a = [0u8; 4096]; let mut b = [0u8; 4096];
+            let alen = loop { let len = sockets[0].recv(&mut a).unwrap(); if a[1] & 0x7f == 96 { break len; } };
+            let blen = loop { let len = sockets[1].recv(&mut b).unwrap(); if b[1] & 0x7f == 96 { break len; } };
+            assert_eq!(&a[..12], &b[..12], "receivers must receive the same RTP sequence and timestamp");
+            assert_ne!(&a[12..alen-8], &b[12..blen-8], "each receiver has its own stream key");
+            let nonce = a[alen-8..alen].to_vec();
+            if let Some(previous) = previous_nonce { assert_ne!(nonce, previous, "successive packets must not reuse a nonce"); }
+            previous_nonce = Some(nonce);
+        }
+        tokio::time::timeout(Duration::from_secs(1), streamer.stop()).await.unwrap().unwrap();
+        assert!(producer.is_closed());
+    }
+}

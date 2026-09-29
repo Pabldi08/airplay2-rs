@@ -654,6 +654,10 @@ pub struct PtpMaster {
     offset_tx: Option<tokio::sync::watch::Sender<ClockOffset>>,
 }
 
+impl Drop for PtpMaster {
+    fn drop(&mut self) { if let Some(task) = self.sync_task.take() { task.abort(); } }
+}
+
 impl PtpMaster {
     /// Create new PTP master.
     pub fn new() -> Self {
@@ -1806,8 +1810,8 @@ pub async fn ptp_sync_loop(
                     tracing::warn!("PTP sync failed: {}", e);
                 }
             }
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
                     break;
                 }
             }

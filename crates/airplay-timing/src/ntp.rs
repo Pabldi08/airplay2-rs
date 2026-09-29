@@ -344,8 +344,8 @@ pub async fn timing_sync_loop(
                     tracing::warn!("Timing sync failed: {}", e);
                 }
             }
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
                     break;
                 }
             }

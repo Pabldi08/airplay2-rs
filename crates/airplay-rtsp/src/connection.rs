@@ -21,6 +21,8 @@ pub struct RtspConnection {
     cseq: u32,
     cipher: Option<ControlCipher>,
     stream: Option<TcpStream>,
+    /// An interrupted request leaves framing/cipher state ambiguous. Require a new session.
+    request_in_flight: bool,
     /// Session headers added to all requests
     session_headers: HashMap<String, String>,
 }
@@ -33,6 +35,7 @@ impl RtspConnection {
             cseq: 0,
             cipher: None,
             stream: None,
+            request_in_flight: false,
             session_headers: HashMap::new(),
         }
     }
@@ -43,6 +46,7 @@ impl RtspConnection {
             .await
             .map_err(|_| RtspError::ConnectionRefused)?;
         self.stream = Some(stream);
+        self.request_in_flight = false;
         Ok(())
     }
 
@@ -78,9 +82,14 @@ impl RtspConnection {
 
     /// Send request and receive response.
     pub async fn send(&mut self, mut request: RtspRequest) -> Result<RtspResponse> {
+        if self.request_in_flight {
+            self.stream = None;
+            return Err(RtspError::InvalidResponse("previous RTSP request was interrupted; reconnect required".into()).into());
+        }
         if self.stream.is_none() {
             return Err(RtspError::ConnectionRefused.into());
         }
+        self.request_in_flight = true;
 
         // Add session headers
         for (key, value) in &self.session_headers {
@@ -152,15 +161,11 @@ impl RtspConnection {
             response.cseq()
         );
 
-        // Verify CSeq matches (warning only, don't fail)
+        // A late response cannot confirm a newer volume/feedback request.
         if response.cseq() != Some(cseq) {
-            tracing::warn!(
-                "CSeq mismatch: expected {}, got {:?}",
-                cseq,
-                response.cseq()
-            );
+            return Err(RtspError::InvalidResponse(format!("CSeq mismatch: expected {cseq}, got {:?}", response.cseq())).into());
         }
-
+        self.request_in_flight = false;
         Ok(response)
     }
 
@@ -173,7 +178,9 @@ impl RtspConnection {
         // Read headers until we see \r\n\r\n
         loop {
             let mut line = String::new();
-            reader.read_line(&mut line).await?;
+            if reader.read_line(&mut line).await? == 0 {
+                return Err(RtspError::InvalidResponse("RTSP peer closed before response headers".into()).into());
+            }
             response_data.extend_from_slice(line.as_bytes());
 
             if line == "\r\n" {
@@ -479,5 +486,27 @@ mod tests {
             let result = shared.close().await;
             assert!(result.is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn eof_exits_and_cancelled_requests_cannot_consume_late_responses() {
+        use tokio::net::TcpListener;
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut connection = RtspConnection::new(listener.local_addr().unwrap());
+        connection.connect().await.unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        drop(peer);
+        let result = timeout(Duration::from_millis(100), connection.send(RtspRequest::feedback("*"))).await.unwrap();
+        assert!(result.is_err());
+
+        let mut connection = RtspConnection::new(listener.local_addr().unwrap());
+        connection.connect().await.unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        assert!(timeout(Duration::from_millis(10), connection.send(RtspRequest::feedback("*"))).await.is_err());
+        let sequence = connection.current_cseq();
+        assert!(connection.send(RtspRequest::feedback("*")).await.is_err());
+        assert_eq!(connection.current_cseq(), sequence);
+        assert!(connection.stream.is_none());
     }
 }

@@ -120,6 +120,18 @@ impl RtspSession {
         &self.device
     }
 
+    /// Merge the receiver's /info response without inventing unknown capabilities.
+    pub fn merge_receiver_info(&mut self, body: &[u8]) -> bool {
+        let Ok(info) = plist_codec::decode::<plist_codec::InfoResponse>(body) else { return false; };
+        if let Some(model) = info.model { self.device.model = model; }
+        if let Some(features) = info.features { self.device.features = airplay_core::Features(features); }
+        if let Some(flags) = info.status_flags { self.device.status_flags = flags as u64; }
+        if let Some(version) = info.source_version.and_then(|s| airplay_core::Version::parse(&s).ok()) { self.device.source_version = version; }
+        if let Some(id) = info.device_id.or(info.mac_address).and_then(|s| airplay_core::DeviceId::from_mac_string(&s).ok()) { self.device.id = id; }
+        if let Some(key) = info.pk.and_then(|key| <[u8; 32]>::try_from(key).ok()) { self.device.public_key = Some(key); }
+        true
+    }
+
     /// Override the client device ID used in SETUP.
     pub fn set_client_device_id(&mut self, device_id: String) {
         self.client_device_id = device_id;
@@ -532,6 +544,27 @@ impl RtspSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receiver_info_updates_advertised_metadata_without_fabricating_missing_fields() {
+        let device = make_test_device();
+        let original_id = device.id.clone();
+        let mut session = RtspSession::new(device, StreamConfig::default());
+        let dictionary = plist::Dictionary::from_iter([
+            (String::from("model"), plist::Value::String("AVR-X2800H".into())),
+            (String::from("features"), plist::Value::Integer(0x100u64.into())),
+            (String::from("statusFlags"), plist::Value::Integer(4u64.into())),
+        ]);
+        let mut body = Vec::new();
+        plist::Value::Dictionary(dictionary).to_writer_binary(&mut body).unwrap();
+        assert!(session.merge_receiver_info(&body));
+        assert_eq!(session.device().model, "AVR-X2800H");
+        assert_eq!(session.device().features.0, 0x100);
+        assert_eq!(session.device().status_flags, 4);
+        assert_eq!(session.device().id, original_id);
+        assert!(!session.merge_receiver_info(b"invalid plist"));
+        assert_eq!(session.device().model, "AVR-X2800H");
+    }
     use airplay_core::device::DeviceId;
     use airplay_core::features::Features;
     use airplay_core::stream::StreamType;

@@ -14,6 +14,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Live audio and UDP regression tests
-        run: cargo test -p airplay-audio --lib --test live_latency_policy --locked
+        run: cargo test -p airplay-audio -p airplay-client -p airplay-rtsp -p airplay-timing --lib --test live_latency_policy --locked
       - name: Check client integration
         run: cargo check -p airplay-client --locked

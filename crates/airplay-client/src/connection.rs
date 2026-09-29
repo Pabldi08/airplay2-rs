@@ -226,6 +226,15 @@ pub struct Connection {
     stream_stats: Arc<crate::stats::StreamStats>,
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.streamer = None;
+        for handle in [&mut self.control_task, &mut self.timing_task, &mut self.ptp_master_sync_task] {
+            if let Some(task) = handle.take() { task.abort(); }
+        }
+    }
+}
+
 impl Connection {
     /// Create new connection to device.
     pub async fn connect(device: Device, config: StreamConfig) -> Result<Self> {
@@ -269,7 +278,9 @@ impl Connection {
 
         // 3. GET /info (required before pairing)
         let info_req = RtspRequest::get_info();
-        let _info_resp = rtsp.send(info_req).await?;
+        let info_resp = rtsp.send(info_req).await?;
+        if let Some(body) = info_resp.body.as_deref() { session.merge_receiver_info(body); }
+        let device = session.device().clone();
 
         // 4. Transient pairing (SRP M1-M4 flow with HKP=4)
         let auth_method = AuthMethod::HomeKitTransient;
@@ -418,7 +429,9 @@ impl Connection {
 
         // 3. GET /info (required before pairing)
         let info_req = RtspRequest::get_info();
-        let _info_resp = rtsp.send(info_req).await?;
+        let info_resp = rtsp.send(info_req).await?;
+        if let Some(body) = info_resp.body.as_deref() { session.merge_receiver_info(body); }
+        let device = session.device().clone();
 
         // 4. Pair-verify (M1-M4 flow with HKP=3)
         let mut pair_verify = PairVerify::new_with_controller(&controller);
@@ -560,7 +573,9 @@ impl Connection {
 
         // 3. GET /info (required before pairing)
         let info_req = RtspRequest::get_info();
-        let _info_resp = rtsp.send(info_req).await?;
+        let info_resp = rtsp.send(info_req).await?;
+        if let Some(body) = info_resp.body.as_deref() { session.merge_receiver_info(body); }
+        let device = session.device().clone();
 
         // 4. HomeKit Normal pair-setup (M1-M6 with HKP=3)
         // Create controller identity for consistent identifiers across pair-setup and pair-verify
@@ -1214,6 +1229,10 @@ impl Connection {
     }
 
     pub async fn start_streaming_live_with_options(&mut self, live_decoder: LiveAudioDecoder, options: airplay_audio::LiveStreamOptions) -> Result<()> {
+        self.start_live_with_senders(live_decoder, options, Vec::new()).await
+    }
+
+    async fn start_live_with_senders(&mut self, live_decoder: LiveAudioDecoder, options: airplay_audio::LiveStreamOptions, extra_senders: Vec<RtpSender>) -> Result<()> {
         // Ensure setup is complete
         if self.session.state() != SessionState::Ready {
             self.setup().await?;
@@ -1225,7 +1244,11 @@ impl Connection {
 
         // Start streamer
         let mut streamer = AudioStreamer::new(self.stream_config.clone());
-        streamer.set_rtp_sender(sender).await;
+        let mut senders = vec![sender];
+        let group = !extra_senders.is_empty();
+        senders.extend(extra_senders);
+        if group { for sender in &mut senders { sender.set_retransmit_max_age(Some(options.max_age.unwrap_or(std::time::Duration::from_millis(200)))); } }
+        streamer.set_rtp_senders(senders).await;
         if self.render_delay_ms > 0 {
             streamer.set_render_delay_ms(self.render_delay_ms).await;
         }
@@ -1234,6 +1257,10 @@ impl Connection {
         }
         if let Some(ref tx) = self.timing_tx {
             streamer.set_timing_updates(tx.subscribe()).await;
+        }
+
+        if self.stream_config.timing_protocol == TimingProtocol::Ptp {
+            if let Some(clock_id) = self.ptp_master_clock_id { streamer.set_ptp_sync_mode(clock_id).await; }
         }
 
         // Set up equalizer if configured
@@ -1374,6 +1401,42 @@ impl Connection {
         Ok(())
     }
 
+    /// Start a PTP group with one encoder, clock, RTP chronology and sending thread.
+    /// Each member keeps its own cipher, nonce sequence and retransmit cache.
+    pub async fn start_group_live(&mut self, live_decoder: LiveAudioDecoder, options: airplay_audio::LiveStreamOptions, members: &mut [Connection]) -> Result<()> {
+        if self.stream_config.timing_protocol != TimingProtocol::Ptp || self.ptp_master_clock_id.is_none() {
+            return Err(RtspError::SetupFailed("group requires established PTP clock".into()).into());
+        }
+        let mut senders = Vec::new();
+        for member in members.iter_mut() {
+            let response = member.rtsp.send(RtspRequest::flush_with_info(member.session.request_uri(), 0, 0)).await?;
+            if response.status_code != 200 { return Err(RtspError::SetupFailed("group FLUSH rejected".into()).into()); }
+            senders.push(member.build_rtp_sender()?);
+        }
+        self.start_live_with_senders(live_decoder, options, senders).await?;
+        for (index, member) in members.iter_mut().enumerate() {
+            let streamer = self.streamer.as_ref().unwrap().clone();
+            member.session.start_playing()?;
+            member.playback_state = PlaybackState::Playing;
+            member.streamer = Some(streamer.clone());
+            if let Some(control) = member.control_receiver.clone() {
+                let runtime = tokio::runtime::Handle::current();
+                member.control_task = Some(tokio::task::spawn_blocking(move || {
+                    while !streamer.is_finished() {
+                        if let Ok(Some((data, _))) = control.recv_raw_timeout(std::time::Duration::from_millis(5)) {
+                            if data.len() < 8 || data[1] & 0x7f != 85 { continue; }
+                            let request = if data.len() == 8 {
+                                Some(airplay_audio::RetransmitRequest { first_sequence: u16::from_be_bytes([data[4], data[5]]), count: u16::from_be_bytes([data[6], data[7]]) })
+                            } else { airplay_audio::RetransmitRequest::parse(&data).ok() };
+                            if let Some(request) = request { let _ = runtime.block_on(streamer.handle_retransmit_for_target(index + 1, &request)); }
+                        }
+                    }
+                }));
+            }
+        }
+        Ok(())
+    }
+
     /// Stop streaming.
     pub async fn stop(&mut self) -> Result<()> {
         if let Some(ref mut streamer) = self.streamer {
@@ -1444,14 +1507,27 @@ impl Connection {
     /// Set volume.
     pub async fn set_volume(&mut self, volume: f32) -> Result<()> {
         let clamped = volume.clamp(0.0, 1.0);
-        self.volume = clamped;
+        if !volume.is_finite() { return Err(RtspError::InvalidResponse("non-finite volume".into()).into()); }
 
         // Send SET_PARAMETER with volume
         let volume_body = self.session.build_set_volume(clamped)?;
         let volume_req = RtspRequest::set_parameter_text(self.session.request_uri(), volume_body);
-        self.rtsp.send(volume_req).await?;
-
+        let response = self.rtsp.send(volume_req).await?;
+        if response.status_code != 200 { return Err(RtspError::InvalidResponse(format!("volume status {}", response.status_code)).into()); }
+        self.volume = clamped;
         Ok(())
+    }
+
+    /// Read the receiver's real volume. Unsupported receivers return None.
+    pub async fn read_volume(&mut self) -> Result<Option<f32>> {
+        let request = RtspRequest::new(airplay_rtsp::RtspMethod::GetParameter, self.session.request_uri())
+            .header("Content-Type", "text/parameters").body(b"volume\r\n".to_vec());
+        let response = self.rtsp.send(request).await?;
+        if response.status_code == 405 || response.status_code == 501 { return Ok(None); }
+        if response.status_code != 200 { return Err(RtspError::InvalidResponse(format!("volume read status {}", response.status_code)).into()); }
+        let value = response.body.as_deref().and_then(parse_receiver_volume);
+        if let Some(volume) = value { self.volume = volume; }
+        Ok(value)
     }
 
     /// Send feedback/keepalive to the receiver.
@@ -1464,6 +1540,7 @@ impl Connection {
         match tokio::time::timeout(std::time::Duration::from_secs(2), self.rtsp.send(req)).await {
             Ok(Ok(resp)) => {
                 tracing::trace!("Feedback response: status={}", resp.status_code);
+                if resp.status_code != 200 { return Err(RtspError::InvalidResponse(format!("feedback status {}", resp.status_code)).into()); }
                 Ok(())
             }
             Ok(Err(e)) => {
@@ -1472,7 +1549,7 @@ impl Connection {
             }
             Err(_) => {
                 tracing::debug!("Feedback request timed out");
-                Ok(()) // Don't fail on timeout - it's just a keepalive
+                Err(CoreError::Timeout)
             }
         }
     }
@@ -2413,5 +2490,23 @@ mod tests {
             let stopped = PlaybackState::Stopped;
             assert_eq!(stopped, PlaybackState::Stopped);
         }
+    }
+}
+
+fn parse_receiver_volume(body: &[u8]) -> Option<f32> {
+    let text = std::str::from_utf8(body).ok()?;
+    let db: f32 = text.lines().find_map(|line| { let (key, value) = line.split_once(':')?; (key.trim() == "volume").then(|| value.trim().parse().ok()).flatten() })?;
+    if !db.is_finite() || db > 0.0 { return None; }
+    Some(if db <= -144.0 { 0.0 } else { 10.0_f32.powf(db / 20.0).clamp(0.0, 1.0) })
+}
+#[cfg(test)]
+mod receiver_volume_tests {
+    use super::*;
+    #[test] fn parses_real_volume_and_rejects_invalid_values() {
+        assert_eq!(parse_receiver_volume(b"volume: -144.00\r\n"), Some(0.0));
+        assert_eq!(parse_receiver_volume(b"volume: 0.00\r\n"), Some(1.0));
+        assert!((parse_receiver_volume(b"volume: -6.02\r\n").unwrap() - 0.5).abs() < 0.001);
+        assert_eq!(parse_receiver_volume(b"volume: NaN"), None);
+        assert_eq!(parse_receiver_volume(b"volume: 10"), None);
     }
 }
