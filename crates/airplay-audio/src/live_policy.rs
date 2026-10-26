@@ -137,3 +137,52 @@ pub(crate) fn expired(captured: Option<Instant>, max_age: Option<Duration>) -> b
 }
 
 pub(crate) type SharedDiagnostics = Arc<LiveDiagnostics>;
+
+/// Preserve the live RTP/wall-time relationship after a capture underrun.
+/// A bounded-age live stream cannot recover missing samples by playing late.
+#[derive(Default)]
+pub(crate) struct LiveTimeline {
+    anchor: Option<(Instant, u64)>,
+    offset: u64,
+}
+impl LiveTimeline {
+    pub(crate) fn timestamp(&mut self, source: u64, sample_rate: u32, now: Instant) -> u32 {
+        let base = source.saturating_add(self.offset);
+        let (at, timestamp) = *self.anchor.get_or_insert((now, base));
+        let elapsed = (now.saturating_duration_since(at).as_nanos() * sample_rate as u128 / 1_000_000_000) as u64;
+        let lag = timestamp.saturating_add(elapsed).saturating_sub(base);
+        if lag > sample_rate as u64 / 50 {
+            self.offset = self.offset.saturating_add(lag);
+        }
+        source.saturating_add(self.offset) as u32
+    }
+}
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+    #[test]
+    fn resumes_after_capture_gap_without_replaying_lost_time() {
+        let now = Instant::now();
+        let mut timeline = LiveTimeline::default();
+        assert_eq!(timeline.timestamp(0, 44100, now), 0);
+        assert_eq!(timeline.timestamp(441, 44100, now + Duration::from_millis(10)), 441);
+        assert_eq!(timeline.timestamp(882, 44100, now + Duration::from_millis(120)), 5292);
+        assert_eq!(timeline.timestamp(1323, 44100, now + Duration::from_millis(130)), 5733);
+    }
+    #[test]
+    fn tolerates_scheduler_jitter_and_does_not_move_audio_backwards() {
+        let now = Instant::now();
+        let mut timeline = LiveTimeline::default();
+        timeline.timestamp(0, 44100, now);
+        assert_eq!(timeline.timestamp(441, 44100, now + Duration::from_millis(25)), 441);
+        assert_eq!(timeline.timestamp(4410, 44100, now + Duration::from_millis(30)), 4410);
+    }
+    #[test]
+    fn wraps_rtp_and_reset_starts_a_new_anchor() {
+        let now = Instant::now();
+        let mut timeline = LiveTimeline::default();
+        assert_eq!(timeline.timestamp(u32::MAX as u64 + 10, 44100, now), 9);
+        timeline = LiveTimeline::default();
+        assert_eq!(timeline.timestamp(100, 44100, now + Duration::from_secs(20)), 100);
+    }
+}
