@@ -533,7 +533,7 @@ impl PtpClient {
     /// Calculate offset from timestamps.
     fn calculate_offset(&mut self) {
         if let (Some(t1), Some(t2), Some(t3), Some(t4)) = (self.t1, self.t2, self.t3, self.t4) {
-            // offset = ((t2 - t1) + (t3 - t4)) / 2
+            // ClockOffset is remote minus local.
             // delay = ((t2 - t1) - (t3 - t4)) / 2
 
             let t1_ns = t1.to_nanos() as i128;
@@ -541,7 +541,7 @@ impl PtpClient {
             let t3_ns = t3.to_nanos() as i128;
             let t4_ns = t4.to_nanos() as i128;
 
-            let offset = ((t2_ns - t1_ns) + (t3_ns - t4_ns)) / 2;
+            let offset = ((t1_ns - t2_ns) + (t4_ns - t3_ns)) / 2;
             let delay = ((t2_ns - t1_ns) - (t3_ns - t4_ns)) / 2;
 
             self.offset = ClockOffset {
@@ -761,7 +761,7 @@ impl PtpMaster {
                                                         let t3_ns = t3v.to_nanos() as i128;
                                                         let t4_ns = t4.to_nanos() as i128;
 
-                                                        let offset_val = ((t2_ns - t1_ns) + (t3_ns - t4_ns)) / 2;
+                                                        let offset_val = ((t1_ns - t2_ns) + (t4_ns - t3_ns)) / 2;
                                                         let delay = ((t2_ns - t1_ns) - (t3_ns - t4_ns)) / 2;
 
                                                         let clock_offset = ClockOffset {
@@ -1497,103 +1497,118 @@ pub async fn run_bmca_yield_flow(
     // Report remote clock identity to caller
     let _ = clock_id_tx.send(remote_clock_id);
 
-    // Phase 4: Slave loop (receive Sync/Follow_Up, send Delay_Req, calculate offset)
-    // Filter all incoming PTP by source IP — only process messages from our master.
-    // Messages from other peers (secondary HomePods sharing ports 319/320) are drained.
-    let mut t1: Option<PtpTimestamp> = None;
-    let mut t2: Option<PtpTimestamp> = None;
-    let mut t3: Option<PtpTimestamp> = None;
-    let mut delay_req_seq: u16 = 0;
-
-    tracing::info!("BMCA: Entering slave loop, syncing to {} (filtering other peers)", master_ip);
-
+    // General messages (Follow_Up and Delay_Resp) arrive on port 320.
+    let mut estimator = BmcaOffsetEstimator::default();
+    let mut delay_req_seq = 0u16;
+    let mut request_port = [0u8; 10];
+    request_port[..8].copy_from_slice(&clock_identity);
+    request_port[8..].copy_from_slice(&1u16.to_be_bytes());
     loop {
         tokio::select! {
             result = event_socket.recv_from(&mut event_buf) => {
-                if let Ok((len, src)) = result {
-                    if src.ip() != master_ip {
-                        tracing::trace!("BMCA slave: Ignoring event from {} (not master {})", src.ip(), master_ip);
-                        continue;
-                    }
-                    if let Ok(header) = PtpHeader::parse(&event_buf[..len]) {
-                        match header.message_type {
-                            PtpMessageType::Sync => {
-                                t2 = Some(PtpTimestamp::now());
-                                tracing::trace!("BMCA slave: Received Sync from {} (seq={})", src.ip(), header.sequence_id);
-                            }
-                            PtpMessageType::DelayResp => {
-                                if len >= 44 {
-                                    if let Ok(t4) = PtpTimestamp::parse(&event_buf[34..44]) {
-                                        if let (Some(t1v), Some(t2v), Some(t3v)) = (t1, t2, t3) {
-                                            let t1_ns = t1v.to_nanos() as i128;
-                                            let t2_ns = t2v.to_nanos() as i128;
-                                            let t3_ns = t3v.to_nanos() as i128;
-                                            let t4_ns = t4.to_nanos() as i128;
-
-                                            let offset_val = ((t2_ns - t1_ns) + (t3_ns - t4_ns)) / 2;
-                                            let delay = ((t2_ns - t1_ns) - (t3_ns - t4_ns)) / 2;
-
-                                            let clock_offset = ClockOffset {
-                                                offset_ns: offset_val as i64,
-                                                error_ns: (delay.abs() / 2) as u64,
-                                                rtt_ns: delay.abs() as u64,
-                                            };
-
-                                            tracing::debug!(
-                                                "BMCA slave: synchronized offset={}ns, delay={}ns",
-                                                clock_offset.offset_ns, clock_offset.rtt_ns
-                                            );
-                                            let _ = offset_tx.send(clock_offset);
-                                        }
-                                        t1 = None;
-                                        t2 = None;
-                                        t3 = None;
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+                let (len, src) = result?;
+                let received_at = PtpTimestamp::now();
+                if src.ip() != master_ip { continue; }
+                if let Ok(header) = PtpHeader::parse(&event_buf[..len]) {
+                    if header.message_type == PtpMessageType::Sync {
+                        estimator.sync(header, received_at);
                     }
                 }
             }
             result = general_socket.recv_from(&mut general_buf) => {
-                if let Ok((len, src)) = result {
-                    if src.ip() != master_ip {
-                        tracing::trace!("BMCA slave: Ignoring general from {} (not master {})", src.ip(), master_ip);
-                        continue;
+                let (len, src) = result?;
+                if src.ip() != master_ip { continue; }
+                let Ok(header) = PtpHeader::parse(&general_buf[..len]) else { continue; };
+                match header.message_type {
+                    PtpMessageType::FollowUp if len >= 44 => {
+                        let Ok(master_at) = PtpTimestamp::parse(&general_buf[34..44]) else { continue; };
+                        if let Some(offset) = estimator.follow_up(&header, master_at) {
+                            let _ = offset_tx.send(offset);
+                        }
+                        // Only matched Sync/Follow_Up pairs can start a delay exchange.
+                        if let Some((t1, t2)) = estimator.matched.take() {
+                            delay_req_seq = delay_req_seq.wrapping_add(1);
+                            let mut request = PtpHeader::new(PtpMessageType::DelayReq, delay_req_seq);
+                            request.source_port_identity = request_port;
+                            request.domain_number = header.domain_number;
+                            let sent_at = PtpTimestamp::now();
+                            let mut packet = [0u8; 44];
+                            packet[..34].copy_from_slice(&request.serialize());
+                            packet[34..].copy_from_slice(&sent_at.serialize());
+                            event_socket.send_to(&packet, event_dest).await?;
+                            estimator.delay = Some((delay_req_seq, t1, t2, sent_at));
+                        }
                     }
-                    if let Ok(header) = PtpHeader::parse(&general_buf[..len]) {
-                        if header.message_type == PtpMessageType::FollowUp && len >= 44 {
-                            if let Ok(ts) = PtpTimestamp::parse(&general_buf[34..44]) {
-                                t1 = Some(ts);
-                                tracing::trace!("BMCA slave: Received Follow_Up from {} (seq={}, t1={}.{:09}s)",
-                                    src.ip(), header.sequence_id, ts.seconds, ts.nanoseconds);
-
-                                // Send Delay_Req
-                                delay_req_seq = delay_req_seq.wrapping_add(1);
-                                let mut delay_header = PtpHeader::new(PtpMessageType::DelayReq, delay_req_seq);
-                                let mut delay_src_port = [0u8; 10];
-                                delay_src_port[..8].copy_from_slice(&clock_identity);
-                                delay_src_port[8..10].copy_from_slice(&1u16.to_be_bytes());
-                                delay_header.source_port_identity = delay_src_port;
-
-                                t3 = Some(PtpTimestamp::now());
-
-                                let mut delay_packet = [0u8; 44];
-                                delay_packet[..34].copy_from_slice(&delay_header.serialize());
-                                delay_packet[34..44].copy_from_slice(&t3.unwrap().serialize());
-
-                                if let Err(e) = event_socket.send_to(&delay_packet, event_dest).await {
-                                    tracing::warn!("BMCA slave: Failed to send Delay_Req: {}", e);
-                                } else {
-                                    tracing::trace!("BMCA slave: Sent Delay_Req (seq={})", delay_req_seq);
-                                }
+                    PtpMessageType::DelayResp if len >= 54 => {
+                        // Delay_Resp must identify our request, not another sender's.
+                        if general_buf[44..54] != request_port { continue; }
+                        if let Ok(t4) = PtpTimestamp::parse(&general_buf[34..44]) {
+                            if let Some(offset) = estimator.delay_response(&header, t4) {
+                                let _ = offset_tx.send(offset);
                             }
                         }
                     }
+                    _ => {}
                 }
             }
         }
+    }
+}
+
+/// HomePod gPTP masters may never answer Delay_Req. A matched two-step Sync
+/// still gives remote-local minus network delay; the least delayed of the last
+/// 32 observations bounds that bias. This is an estimate, not a measured RTT.
+#[derive(Default)]
+struct BmcaOffsetEstimator {
+    pending: Option<(PtpHeader, PtpTimestamp)>,
+    matched: Option<(PtpTimestamp, PtpTimestamp)>,
+    delay: Option<(u16, PtpTimestamp, PtpTimestamp, PtpTimestamp)>,
+    master: Option<([u8; 10], u8)>,
+    samples: std::collections::VecDeque<i64>,
+    last_offset: Option<i64>,
+}
+
+impl BmcaOffsetEstimator {
+    fn sync(&mut self, header: PtpHeader, received_at: PtpTimestamp) {
+        let identity = (header.source_port_identity, header.domain_number);
+        if self.master != Some(identity) {
+            self.samples.clear();
+            self.last_offset = None;
+            self.delay = None;
+            self.master = Some(identity);
+        }
+        self.pending = Some((header, received_at));
+        self.matched = None;
+    }
+
+    fn follow_up(&mut self, header: &PtpHeader, master_at: PtpTimestamp) -> Option<ClockOffset> {
+        let (sync, received_at) = self.pending.as_ref()?;
+        if sync.sequence_id != header.sequence_id
+            || sync.source_port_identity != header.source_port_identity
+            || sync.domain_number != header.domain_number { return None; }
+        // correctionField is scaled nanoseconds (2^-16 ns).
+        let correction = (sync.correction_field as i128 + header.correction_field as i128) / 65_536;
+        let sample = i64::try_from(master_at.to_nanos() as i128 + correction - received_at.to_nanos() as i128).ok()?;
+        self.matched = Some((master_at, *received_at));
+        self.pending = None;
+        if self.samples.len() == 32 { self.samples.pop_front(); }
+        self.samples.push_back(sample);
+        let best = *self.samples.iter().max()?;
+        if self.last_offset.is_some_and(|last| last.abs_diff(best) <= 500_000) { return None; }
+        self.last_offset = Some(best);
+        Some(ClockOffset { offset_ns: best, error_ns: self.samples.iter().min().unwrap().abs_diff(best), rtt_ns: 0 })
+    }
+
+    fn delay_response(&mut self, header: &PtpHeader, t4: PtpTimestamp) -> Option<ClockOffset> {
+        let (sequence, t1, t2, t3) = self.delay?;
+        if sequence != header.sequence_id || self.master != Some((header.source_port_identity, header.domain_number)) { return None; }
+        self.delay = None;
+        let outbound = t2.to_nanos() as i128 - t1.to_nanos() as i128;
+        let inbound = t4.to_nanos() as i128 - t3.to_nanos() as i128;
+        let offset = i64::try_from((inbound - outbound) / 2).ok()?;
+        let delay = ((outbound + inbound) / 2).unsigned_abs() as u64;
+        self.last_offset = Some(offset);
+        Some(ClockOffset { offset_ns: offset, error_ns: delay / 2, rtt_ns: delay })
     }
 }
 
@@ -1964,7 +1979,7 @@ pub async fn run_ptp_slave(
                                                 let t4_ns = t4.to_nanos() as i128;
 
                                                 let offset_val =
-                                                    ((t2_ns - t1_ns) + (t3_ns - t4_ns)) / 2;
+                                                    ((t1_ns - t2_ns) + (t4_ns - t3_ns)) / 2;
                                                 let delay =
                                                     ((t2_ns - t1_ns) - (t3_ns - t4_ns)) / 2;
 
@@ -2271,8 +2286,8 @@ mod tests {
             client.calculate_offset();
 
             // offset = ((10-15) + (20-25)) / 2 = (-5 + (-5)) / 2 = -5ms
-            // Negative means local is behind (master is ahead)
-            assert!(client.offset.offset_ns < 0);
+            // Positive means the remote master is ahead.
+            assert_eq!(client.offset.offset_ns, 5_000_000);
         }
 
         #[test]
@@ -2289,8 +2304,8 @@ mod tests {
             client.calculate_offset();
 
             // offset = ((10-5) + (20-15)) / 2 = (5 + 5) / 2 = 5ms
-            // Positive means local is ahead (master is behind)
-            assert!(client.offset.offset_ns > 0);
+            // Negative means the remote master is behind.
+            assert_eq!(client.offset.offset_ns, -5_000_000);
         }
 
         #[test]
@@ -2413,5 +2428,45 @@ mod tests {
 
             assert_eq!(recovered, original);
         }
+    }
+}
+
+#[cfg(test)]
+mod bmca_offset_regressions {
+    use super::*;
+    fn header(kind: PtpMessageType, seq: u16) -> PtpHeader {
+        let mut h = PtpHeader::new(kind, seq);
+        h.source_port_identity = [7; 10]; h
+    }
+    #[test]
+    fn uptime_clock_is_estimated_without_delay_response_and_sequences_must_match() {
+        let mut estimate = BmcaOffsetEstimator::default();
+        estimate.sync(header(PtpMessageType::Sync, 5), PtpTimestamp::from_nanos(1_700_000_000_000_000_000));
+        assert!(estimate.follow_up(&header(PtpMessageType::FollowUp, 4), PtpTimestamp::from_nanos(433_324_000_000_000)).is_none());
+        let offset = estimate.follow_up(&header(PtpMessageType::FollowUp, 5), PtpTimestamp::from_nanos(433_324_000_000_000)).unwrap();
+        assert_eq!(1_700_000_000_000_000_000i128 + offset.offset_ns as i128, 433_324_000_000_000);
+        assert!(estimate.follow_up(&header(PtpMessageType::FollowUp, 5), PtpTimestamp::from_nanos(1)).is_none());
+    }
+    #[test]
+    fn least_delayed_sample_wins_and_window_is_bounded() {
+        let mut estimate = BmcaOffsetEstimator::default();
+        for seq in 0..40 {
+            estimate.sync(header(PtpMessageType::Sync, seq), PtpTimestamp::from_nanos(100_000_000));
+            estimate.follow_up(&header(PtpMessageType::FollowUp, seq), PtpTimestamp::from_nanos(105_000_000 + seq as u128 * 100_000));
+        }
+        assert_eq!(estimate.samples.len(), 32);
+        assert_eq!(*estimate.samples.iter().max().unwrap(), 8_900_000);
+    }
+    #[test]
+    fn rejects_wrong_clock_and_handles_delay_response_with_remote_minus_local_sign() {
+        let mut estimate = BmcaOffsetEstimator::default();
+        estimate.sync(header(PtpMessageType::Sync, 1), PtpTimestamp::from_nanos(110_000_000));
+        let mut wrong = header(PtpMessageType::FollowUp, 1); wrong.source_port_identity = [8; 10];
+        assert!(estimate.follow_up(&wrong, PtpTimestamp::from_nanos(100_000_000)).is_none());
+        estimate.delay = Some((2, PtpTimestamp::from_nanos(105_000_000), PtpTimestamp::from_nanos(110_000_000), PtpTimestamp::from_nanos(120_000_000)));
+        assert!(estimate.delay_response(&header(PtpMessageType::DelayResp, 1), PtpTimestamp::from_nanos(135_000_000)).is_none());
+        let offset = estimate.delay_response(&header(PtpMessageType::DelayResp, 2), PtpTimestamp::from_nanos(135_000_000)).unwrap();
+        assert_eq!(offset.offset_ns, 5_000_000);
+        assert_eq!(offset.rtt_ns, 10_000_000);
     }
 }

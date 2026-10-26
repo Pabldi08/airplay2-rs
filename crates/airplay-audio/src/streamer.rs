@@ -465,6 +465,7 @@ struct StreamerInner {
     equalizer: Option<Equalizer>,
     /// Track whether first audio packet has been sent (requires marker bit)
     first_packet_sent: bool,
+    live_timeline: crate::live_policy::LiveTimeline,
     /// Render delay in nanoseconds added to NTP timestamps in sync packets.
     /// Tells the receiver to render audio this far in the future, giving more
     /// time for retransmit recovery of lost packets.
@@ -543,6 +544,7 @@ impl AudioStreamer {
                 encoder: None,
                 equalizer: None,
                 first_packet_sent: false,
+                live_timeline: crate::live_policy::LiveTimeline::default(),
                 render_delay_ns: 0,
                 use_ptp_sync: false,
                 ptp_master_clock_id: [0u8; 8],
@@ -935,6 +937,7 @@ impl AudioStreamer {
     pub async fn reset_after_flush(&mut self) {
         let mut inner = self.inner.lock().await;
         inner.first_packet_sent = false;
+        inner.live_timeline = crate::live_policy::LiveTimeline::default();
         for sender in &mut inner.rtp_senders {
             sender.reset_sync_state();
         }
@@ -1266,6 +1269,7 @@ async fn run_streamer(
                 if guard.live_options.max_age.is_some() && guard.metrics.packets_sent.load(Ordering::Relaxed) == 0
                     && guard.metrics.force_sync.load(Ordering::Acquire) {
                     guard.first_packet_sent = false;
+                    guard.live_timeline = crate::live_policy::LiveTimeline::default();
                 }
                 // Set marker bit on first audio packet (required by some receivers)
                 let first_packet = !guard.first_packet_sent;
@@ -1274,7 +1278,9 @@ async fn run_streamer(
                     tracing::info!("Sending first audio packet with marker bit set");
                 }
 
-                let rtp_ts = if guard.live_options.max_age.is_some() { frame.timestamp as u32 } else { packet.timestamp as u32 };
+                let rtp_ts = if guard.live_options.max_age.is_some() {
+                    guard.live_timeline.timestamp(frame.timestamp, sample_rate, std::time::Instant::now())
+                } else { packet.timestamp as u32 };
 
                 // Determine if sync is needed BEFORE borrowing rtp_sender
                 let need_sync = guard.metrics.force_sync.swap(false, Ordering::AcqRel)
